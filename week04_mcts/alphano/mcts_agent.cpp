@@ -1,27 +1,13 @@
-/*
- * ==== Ataxx MCTS Agent ====
- *
- * Uses Monte Carlo Tree Search with UCB1 for move selection.
- * - Selection: UCB1 (C=1.414)
- * - Expansion: Add one child node
- * - Simulation: Random rollout to terminal state
- * - Backpropagation: Update wins/visits up the tree
- * - Time management: 150ms if my_time > 1000ms, else 10ms
- */
-
 #include <bits/stdc++.h>
 using namespace std;
 
-// ---- Global State ----
 int board[8][8];
 int turn;
 
-const int dx[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
-const int dy[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
+const int dx[8] = {-1,-1,-1,0,0,1,1,1};
+const int dy[8] = {-1,0,1,-1,1,-1,0,1};
 
-mt19937 rng(chrono::steady_clock::now().time_since_epoch().count());
-
-// ---- Board Utilities ----
+int root_player;
 
 void copy_board(int src[8][8], int dst[8][8]) {
     for (int i = 1; i <= 7; i++) {
@@ -42,171 +28,193 @@ int count_pieces(int b[8][8], int player) {
 }
 
 void sim_move(int b[8][8], int x1, int y1, int x2, int y2, int player) {
-    if (x1 == -1) return; // pass
-
     int dist = max(abs(x2 - x1), abs(y2 - y1));
-    if (dist == 2) {
-        b[x1][y1] = 0; // jump
-    }
-    b[x2][y2] = player;
 
-    // Convert adjacent opponent pieces
+    if (dist == 1) {
+        // Split move
+        b[x2][y2] = player;
+    } else {
+        // Jump move
+        b[x1][y1] = 0;
+        b[x2][y2] = player;
+    }
+
+    // Infect adjacent opponent pieces
     for (int d = 0; d < 8; d++) {
         int nx = x2 + dx[d];
         int ny = y2 + dy[d];
         if (nx >= 1 && nx <= 7 && ny >= 1 && ny <= 7) {
-            if (b[nx][ny] == (3 - player)) {
+            if (b[nx][ny] == (player ^ 3)) {
                 b[nx][ny] = player;
             }
         }
     }
 }
 
-vector<tuple<int,int,int,int>> get_moves(int b[8][8], int player) {
-    vector<tuple<int,int,int,int>> moves;
+int gen_moves(int b[8][8], int player, int moves[][4]) {
+    int cnt = 0;
+    for (int x1 = 1; x1 <= 7; x1++) {
+        for (int y1 = 1; y1 <= 7; y1++) {
+            if (b[x1][y1] != player) continue;
 
-    for (int i = 1; i <= 7; i++) {
-        for (int j = 1; j <= 7; j++) {
-            if (b[i][j] != player) continue;
+            for (int x2 = x1 - 2; x2 <= x1 + 2; x2++) {
+                if (x2 < 1 || x2 > 7) continue;
 
-            // Try all 8 directions, distance 1 or 2
-            for (int d = 0; d < 8; d++) {
-                for (int dist = 1; dist <= 2; dist++) {
-                    int ni = i + dx[d] * dist;
-                    int nj = j + dy[d] * dist;
+                for (int y2 = y1 - 2; y2 <= y1 + 2; y2++) {
+                    if (y2 < 1 || y2 > 7) continue;
+                    if (x2 == x1 && y2 == y1) continue;
+                    if (b[x2][y2] != 0) continue;
 
-                    if (ni >= 1 && ni <= 7 && nj >= 1 && nj <= 7 && b[ni][nj] == 0) {
-                        moves.push_back({i, j, ni, nj});
-                    }
+                    moves[cnt][0] = x1;
+                    moves[cnt][1] = y1;
+                    moves[cnt][2] = x2;
+                    moves[cnt][3] = y2;
+                    cnt++;
                 }
             }
         }
     }
-
-    if (moves.empty()) {
-        moves.push_back({-1, -1, -1, -1}); // pass
-    }
-
-    return moves;
+    return cnt;
 }
-
-bool is_terminal(int b[8][8]) {
-    int first = count_pieces(b, 1);
-    int second = count_pieces(b, 2);
-
-    if (first == 0 || second == 0) return true;
-    if (first + second == 49) return true; // board full
-
-    // Check if both players have no moves
-    auto m1 = get_moves(b, 1);
-    auto m2 = get_moves(b, 2);
-
-    if (m1.size() == 1 && get<0>(m1[0]) == -1 &&
-        m2.size() == 1 && get<0>(m2[0]) == -1) {
-        return true;
-    }
-
-    return false;
-}
-
-// ---- MCTS Node ----
 
 struct Node {
     int b[8][8];
     int player;
     Node* parent;
-    tuple<int,int,int,int> move;
+    int move[4];
     vector<Node*> children;
     double wins;
     int visits;
-    vector<tuple<int,int,int,int>> untried;
+    int untried[200][4];
+    int untried_cnt;
 
-    Node(int board[8][8], int p, Node* par = nullptr, tuple<int,int,int,int> m = {0,0,0,0})
-        : player(p), parent(par), move(m), wins(0), visits(0) {
+    Node(int board[8][8], int p, Node* par, int* m) {
         copy_board(board, b);
-        untried = get_moves(b, player);
+        player = p;
+        parent = par;
+        if (m) {
+            move[0] = m[0];
+            move[1] = m[1];
+            move[2] = m[2];
+            move[3] = m[3];
+        }
+        wins = 0.0;
+        visits = 0;
+        untried_cnt = gen_moves(b, player, untried);
     }
 
     ~Node() {
-        for (auto child : children) {
+        for (Node* child : children) {
             delete child;
         }
     }
+
+    bool is_terminal() {
+        return untried_cnt == 0 && children.empty();
+    }
+
+    bool has_untried_moves() {
+        return untried_cnt > 0;
+    }
 };
 
-// ---- MCTS Functions ----
-
-double ucb1(Node* node, double c = 1.414) {
-    if (node->visits == 0) return 1e9;
-    return (node->wins / node->visits) + c * sqrt(log(node->parent->visits) / node->visits);
+double ucb1(Node* n) {
+    if (n->visits == 0) return 1e9;
+    return (n->wins / n->visits) + 1.414 * sqrt(log(n->parent->visits) / n->visits);
 }
 
-Node* select(Node* node) {
-    while (!node->children.empty()) {
-        Node* best = nullptr;
-        double best_ucb = -1e9;
+Node* best_child_ucb(Node* node) {
+    Node* best = nullptr;
+    double best_score = -1e9;
 
-        for (auto child : node->children) {
-            double val = ucb1(child);
-            if (val > best_ucb) {
-                best_ucb = val;
-                best = child;
-            }
+    for (Node* child : node->children) {
+        double score = ucb1(child);
+        if (score > best_score) {
+            best_score = score;
+            best = child;
         }
-
-        node = best;
     }
-    return node;
+
+    return best;
 }
 
 Node* expand(Node* node) {
-    if (node->untried.empty()) return node;
+    int idx = rand() % node->untried_cnt;
+    int* m = node->untried[idx];
 
-    // Pick random untried move
-    int idx = rng() % node->untried.size();
-    auto move = node->untried[idx];
-    node->untried.erase(node->untried.begin() + idx);
-
-    // Create child node
     int new_board[8][8];
     copy_board(node->b, new_board);
-    sim_move(new_board, get<0>(move), get<1>(move), get<2>(move), get<3>(move), node->player);
+    sim_move(new_board, m[0], m[1], m[2], m[3], node->player);
 
-    Node* child = new Node(new_board, 3 - node->player, node, move);
+    Node* child = new Node(new_board, node->player ^ 3, node, m);
     node->children.push_back(child);
 
+    // Remove from untried
+    node->untried[idx][0] = node->untried[node->untried_cnt - 1][0];
+    node->untried[idx][1] = node->untried[node->untried_cnt - 1][1];
+    node->untried[idx][2] = node->untried[node->untried_cnt - 1][2];
+    node->untried[idx][3] = node->untried[node->untried_cnt - 1][3];
+    node->untried_cnt--;
+
     return child;
+}
+
+Node* tree_policy(Node* root) {
+    Node* node = root;
+
+    while (!node->is_terminal()) {
+        if (node->has_untried_moves()) {
+            return expand(node);
+        } else {
+            node = best_child_ucb(node);
+        }
+    }
+
+    return node;
 }
 
 double rollout(Node* node) {
     int sim_board[8][8];
     copy_board(node->b, sim_board);
-    int sim_player = node->player;
+    int current_player = node->player;
 
-    int max_moves = 200;
-    for (int iter = 0; iter < max_moves && !is_terminal(sim_board); iter++) {
-        auto moves = get_moves(sim_board, sim_player);
-        auto move = moves[rng() % moves.size()];
-        sim_move(sim_board, get<0>(move), get<1>(move), get<2>(move), get<3>(move), sim_player);
-        sim_player = 3 - sim_player;
+    for (int step = 0; step < 200; step++) {
+        int moves[200][4];
+        int cnt = gen_moves(sim_board, current_player, moves);
+
+        if (cnt == 0) {
+            // Pass
+            current_player ^= 3;
+            int opp_cnt = gen_moves(sim_board, current_player, moves);
+            if (opp_cnt == 0) {
+                // Both pass - game over
+                break;
+            }
+            continue;
+        }
+
+        // Random move
+        int idx = rand() % cnt;
+        sim_move(sim_board, moves[idx][0], moves[idx][1], moves[idx][2], moves[idx][3], current_player);
+        current_player ^= 3;
     }
 
-    int first = count_pieces(sim_board, 1);
-    int second = count_pieces(sim_board, 2);
+    // Evaluate from root player's perspective
+    int my_count = count_pieces(sim_board, root_player);
+    int opp_count = count_pieces(sim_board, root_player ^ 3);
 
-    // Return result from perspective of player 1
-    if (first > second) return 1.0;
-    if (first < second) return 0.0;
+    if (my_count > opp_count) return 1.0;
+    if (my_count < opp_count) return 0.0;
     return 0.5;
 }
 
 void backprop(Node* node, double result) {
     while (node) {
         node->visits++;
-        // result is from player 1's perspective
-        // node->player is the player who just MOVED to create this state
-        // so we need to flip perspective
-        if (node->player == 2) {
+        // Result is from root player's perspective
+        // node->player is who plays NEXT from this state
+        // If it's opponent's turn at this node, this is good for root player
+        if (node->player != root_player) {
             node->wins += result;
         } else {
             node->wins += (1.0 - result);
@@ -216,146 +224,139 @@ void backprop(Node* node, double result) {
 }
 
 tuple<int,int,int,int> mcts_search(int time_limit_ms) {
-    Node* root = new Node(board, turn);
+    Node* root = new Node(board, turn, nullptr, nullptr);
+    root_player = turn;
 
-    auto start = chrono::steady_clock::now();
+    auto start = chrono::high_resolution_clock::now();
     int iterations = 0;
 
     while (true) {
-        auto now = chrono::steady_clock::now();
+        auto now = chrono::high_resolution_clock::now();
         auto elapsed = chrono::duration_cast<chrono::milliseconds>(now - start).count();
         if (elapsed >= time_limit_ms) break;
 
-        // Selection
-        Node* node = select(root);
-
-        // Expansion
-        if (!node->untried.empty() && node->visits > 0) {
-            node = expand(node);
-        }
-
-        // Simulation
+        Node* node = tree_policy(root);
         double result = rollout(node);
-
-        // Backpropagation
         backprop(node, result);
-
         iterations++;
     }
 
-    // Select best move (most visited child)
+    // Best child = most visited
     Node* best = nullptr;
-    int best_visits = -1;
-
-    for (auto child : root->children) {
-        if (child->visits > best_visits) {
-            best_visits = child->visits;
+    int max_visits = -1;
+    for (Node* child : root->children) {
+        if (child->visits > max_visits) {
+            max_visits = child->visits;
             best = child;
         }
     }
 
-    tuple<int,int,int,int> best_move = {-1, -1, -1, -1};
+    cerr << "MCTS: " << iterations << " iterations, best visits: " << max_visits << endl;
+
+    tuple<int,int,int,int> result;
     if (best) {
-        best_move = best->move;
-        cerr << "MCTS iterations: " << iterations
-             << " | Best move visits: " << best->visits
-             << " | Win rate: " << (best->wins / best->visits) << endl;
+        result = make_tuple(best->move[0], best->move[1], best->move[2], best->move[3]);
+    } else {
+        // No moves found - should not happen if called correctly
+        result = make_tuple(-1, -1, -1, -1);
     }
 
     delete root;
-    return best_move;
+    return result;
 }
 
-// ---- Move Selection ----
-
 tuple<int,int,int,int> find_move(int my_time) {
-    int time_limit = (my_time > 1000) ? 150 : 10;
+    int time_limit;
+    if (my_time > 30000) time_limit = 800;
+    else if (my_time > 10000) time_limit = 400;
+    else if (my_time > 3000) time_limit = 150;
+    else time_limit = 50;
+
     return mcts_search(time_limit);
 }
 
-// ---- Protocol Functions ----
-
 void apply_my_move(int x1, int y1, int x2, int y2) {
-    assert(turn == 1);
-    if (x1 == -1) {
-        turn = 2;
-        return;
-    }
+    if (x1 == -1) return; // pass
 
-    assert(board[x1][y1] == 1);
     int dist = max(abs(x2 - x1), abs(y2 - y1));
     assert(dist == 1 || dist == 2);
+    assert(board[x1][y1] == turn);
     assert(board[x2][y2] == 0);
 
-    if (dist == 2) board[x1][y1] = 0;
-    board[x2][y2] = 1;
+    if (dist == 1) {
+        board[x2][y2] = turn;
+    } else {
+        board[x1][y1] = 0;
+        board[x2][y2] = turn;
+    }
 
     for (int d = 0; d < 8; d++) {
         int nx = x2 + dx[d];
         int ny = y2 + dy[d];
-        if (nx >= 1 && nx <= 7 && ny >= 1 && ny <= 7 && board[nx][ny] == 2) {
-            board[nx][ny] = 1;
+        if (nx >= 1 && nx <= 7 && ny >= 1 && ny <= 7) {
+            if (board[nx][ny] == (turn ^ 3)) {
+                board[nx][ny] = turn;
+            }
         }
     }
-
-    turn = 2;
 }
 
 void apply_opp_move(int x1, int y1, int x2, int y2) {
-    assert(turn == 2);
-    if (x1 == -1) {
-        turn = 1;
-        return;
-    }
+    if (x1 == -1) return; // pass
 
-    assert(board[x1][y1] == 2);
+    int opp = turn ^ 3;
     int dist = max(abs(x2 - x1), abs(y2 - y1));
     assert(dist == 1 || dist == 2);
+    assert(board[x1][y1] == opp);
     assert(board[x2][y2] == 0);
 
-    if (dist == 2) board[x1][y1] = 0;
-    board[x2][y2] = 2;
+    if (dist == 1) {
+        board[x2][y2] = opp;
+    } else {
+        board[x1][y1] = 0;
+        board[x2][y2] = opp;
+    }
 
     for (int d = 0; d < 8; d++) {
         int nx = x2 + dx[d];
         int ny = y2 + dy[d];
-        if (nx >= 1 && nx <= 7 && ny >= 1 && ny <= 7 && board[nx][ny] == 1) {
-            board[nx][ny] = 2;
+        if (nx >= 1 && nx <= 7 && ny >= 1 && ny <= 7) {
+            if (board[nx][ny] == turn) {
+                board[nx][ny] = opp;
+            }
         }
     }
-
-    turn = 1;
 }
 
-// ---- Main ----
-
 int main() {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
+    srand(time(0));
 
-    memset(board, 0, sizeof(board));
     board[1][1] = board[7][7] = 1;
     board[1][7] = board[7][1] = 2;
-    turn = 1;
 
-    string cmd;
-    while (cin >> cmd) {
-        if (cmd == "TURN") {
-            int my_time;
-            cin >> my_time;
+    string line;
+    while (getline(cin, line)) {
+        istringstream in(line);
+        string cmd;
+        in >> cmd;
 
-            auto [x1, y1, x2, y2] = find_move(my_time);
-            cout << x1 << " " << y1 << " " << x2 << " " << y2 << endl;
+        if (cmd == "READY") {
+            string role;
+            in >> role;
+            turn = (role == "FIRST") ? 1 : 2;
+            cout << "OK" << endl;
+        } else if (cmd == "TURN") {
+            int t1, t2;
+            in >> t1 >> t2;
+
+            auto [x1, y1, x2, y2] = find_move(t1);
             apply_my_move(x1, y1, x2, y2);
-
+            cout << "MOVE " << x1 << " " << y1 << " " << x2 << " " << y2 << endl;
         } else if (cmd == "OPP") {
             int x1, y1, x2, y2, t;
-            cin >> x1 >> y1 >> x2 >> y2 >> t;
+            in >> x1 >> y1 >> x2 >> y2 >> t;
             apply_opp_move(x1, y1, x2, y2);
-
-        } else if (cmd == "END") {
-            int result;
-            cin >> result;
+        } else if (cmd == "FINISH") {
             break;
         }
     }

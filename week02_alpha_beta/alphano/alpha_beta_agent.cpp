@@ -1,367 +1,360 @@
-/*
- * ============================================================
- * Ataxx Alpha-Beta Agent
- * ============================================================
- * Strategy: Negamax with Alpha-Beta Pruning (depth=4)
- * Evaluation: Piece count + Position weights + Mobility
- * Game phase adaptive weighting
- */
-
 #include <bits/stdc++.h>
 using namespace std;
 
-// ------------------------------------------------------------
-// Global state
-// ------------------------------------------------------------
+/*
+ * ============================================================
+ *  Ataxx Alpha-Beta Agent (Enhanced)
+ *  ------------------------------------------------------------
+ *  - Board size: 7x7 (1-indexed)
+ *  - Piece values: 0 = empty, 1 = FIRST(O), 2 = SECOND(X)
+ *  - Negamax + Alpha-Beta + Iterative Deepening
+ *  - Make/Undo move (no board copies)
+ *  - Move ordering by capture count
+ * ============================================================
+ */
 
-int board[8][8];  // 1-indexed, 0=empty, 1=FIRST, 2=SECOND
-int turn;         // 1 or 2
-string role;      // "FIRST" or "SECOND"
+const int dx[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
+const int dy[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
 
-// ------------------------------------------------------------
-// Constants
-// ------------------------------------------------------------
+int board[8][8];
+int turn;
+int node_count;
 
-const int dx[8] = {-1, -1, -1,  0,  0,  1,  1,  1};
-const int dy[8] = {-1,  0,  1, -1,  1, -1,  0,  1};
-
-const int MAX_DEPTH = 4;
 const int INF = 1e9;
 
-// Position weights (1-indexed, index 0 unused)
-const int POS_WEIGHT[8][8] = {
-    {0,   0,   0,   0,   0,   0,   0,   0},  // row 0 unused
-    {0, 100, -20,  10,   5,  10, -20, 100},  // row 1
-    {0, -20, -40,  -5,  -5,  -5, -40, -20},  // row 2
-    {0,  10,  -5,  10,   5,  10,  -5,  10},  // row 3
-    {0,   5,  -5,   5,   0,   5,  -5,   5},  // row 4
-    {0,  10,  -5,  10,   5,  10,  -5,  10},  // row 5
-    {0, -20, -40,  -5,  -5,  -5, -40, -20},  // row 6
-    {0, 100, -20,  10,   5,  10, -20, 100},  // row 7
+// ------------------------------------------------------------
+// Undo stack: stores info to reverse a move
+// ------------------------------------------------------------
+struct UndoInfo {
+    int x1, y1, x2, y2;
+    int dist;
+    int infected[8][2];
+    int infected_cnt;
 };
 
-// ------------------------------------------------------------
-// Board utilities
-// ------------------------------------------------------------
+UndoInfo undo_stack[128];
+int undo_top = 0;
 
-void copy_board(int src[8][8], int dst[8][8]) {
-    for (int i = 1; i <= 7; i++) {
-        for (int j = 1; j <= 7; j++) {
-            dst[i][j] = src[i][j];
-        }
-    }
+// ------------------------------------------------------------
+// Count pieces for a player
+// ------------------------------------------------------------
+int count_pieces(int player) {
+    int cnt = 0;
+    for (int i = 1; i <= 7; i++)
+        for (int j = 1; j <= 7; j++)
+            if (board[i][j] == player) cnt++;
+    return cnt;
 }
 
-int count_pieces(int b[8][8], int player) {
+// ------------------------------------------------------------
+// Count how many opponent pieces are adjacent to (x,y)
+// ------------------------------------------------------------
+int count_adj_opp(int x, int y, int opp) {
     int cnt = 0;
-    for (int i = 1; i <= 7; i++) {
-        for (int j = 1; j <= 7; j++) {
-            if (b[i][j] == player) cnt++;
-        }
+    for (int d = 0; d < 8; d++) {
+        int nx = x + dx[d], ny = y + dy[d];
+        if (nx >= 1 && nx <= 7 && ny >= 1 && ny <= 7 && board[nx][ny] == opp)
+            cnt++;
     }
     return cnt;
 }
 
-void simulate_move(int b[8][8], int x1, int y1, int x2, int y2, int player) {
-    int dist = max(abs(x2 - x1), abs(y2 - y1));
-    assert(dist == 1 || dist == 2);
-    assert(b[x1][y1] == player);
-    assert(b[x2][y2] == 0);
+// ------------------------------------------------------------
+// Make move on global board, push undo info
+// ------------------------------------------------------------
+void make_move(int x1, int y1, int x2, int y2, int player) {
+    UndoInfo& u = undo_stack[undo_top++];
+    u.x1 = x1; u.y1 = y1; u.x2 = x2; u.y2 = y2;
+    u.infected_cnt = 0;
 
-    if (dist == 1) {
-        // Split: copy
-        b[x2][y2] = player;
-    } else {
-        // Jump: move
-        b[x1][y1] = 0;
-        b[x2][y2] = player;
-    }
+    u.dist = max(abs(x2 - x1), abs(y2 - y1));
+    if (u.dist == 2) board[x1][y1] = 0;
+    board[x2][y2] = player;
 
-    // Infect adjacent opponent pieces
     int opp = player ^ 3;
     for (int d = 0; d < 8; d++) {
-        int nx = x2 + dx[d];
-        int ny = y2 + dy[d];
-        if (nx >= 1 && nx <= 7 && ny >= 1 && ny <= 7 && b[nx][ny] == opp) {
-            b[nx][ny] = player;
+        int nx = x2 + dx[d], ny = y2 + dy[d];
+        if (nx >= 1 && nx <= 7 && ny >= 1 && ny <= 7 && board[nx][ny] == opp) {
+            u.infected[u.infected_cnt][0] = nx;
+            u.infected[u.infected_cnt][1] = ny;
+            u.infected_cnt++;
+            board[nx][ny] = player;
         }
     }
 }
 
-vector<tuple<int,int,int,int>> find_all_moves(int b[8][8], int player) {
-    vector<tuple<int,int,int,int>> moves;
+// ------------------------------------------------------------
+// Undo the last move
+// ------------------------------------------------------------
+void undo_move(int player) {
+    UndoInfo& u = undo_stack[--undo_top];
+    int opp = player ^ 3;
+
+    // Restore infected pieces
+    for (int i = 0; i < u.infected_cnt; i++)
+        board[u.infected[i][0]][u.infected[i][1]] = opp;
+
+    // Remove piece from destination
+    board[u.x2][u.y2] = 0;
+
+    // Restore source if jump
+    if (u.dist == 2) board[u.x1][u.y1] = player;
+}
+
+// ------------------------------------------------------------
+// Generate all legal moves with their capture scores.
+// Returns moves sorted by capture count (descending).
+// Splits before jumps at equal capture count.
+// ------------------------------------------------------------
+struct ScoredMove {
+    int x1, y1, x2, y2;
+    int score; // higher = better ordering
+};
+
+int gen_moves(ScoredMove* moves, int player) {
+    int cnt = 0;
+    int opp = player ^ 3;
 
     for (int x1 = 1; x1 <= 7; x1++) {
         for (int y1 = 1; y1 <= 7; y1++) {
-            if (b[x1][y1] != player) continue;
+            if (board[x1][y1] != player) continue;
+            for (int x2 = x1 - 2; x2 <= x1 + 2; x2++) {
+                if (x2 < 1 || x2 > 7) continue;
+                for (int y2 = y1 - 2; y2 <= y1 + 2; y2++) {
+                    if (y2 < 1 || y2 > 7) continue;
+                    if (x2 == x1 && y2 == y1) continue;
+                    if (board[x2][y2] != 0) continue;
 
-            // Check all positions within distance 2
-            for (int dx = -2; dx <= 2; dx++) {
-                for (int dy = -2; dy <= 2; dy++) {
-                    if (dx == 0 && dy == 0) continue;
+                    int dist = max(abs(x2 - x1), abs(y2 - y1));
+                    int captures = count_adj_opp(x2, y2, opp);
+                    // Split gains 1 piece + captures*2, Jump gains captures*2
+                    // Score for ordering: captures * 10 + split_bonus
+                    int s = captures * 10 + (dist == 1 ? 5 : 0);
 
-                    int x2 = x1 + dx;
-                    int y2 = y1 + dy;
+                    moves[cnt++] = {x1, y1, x2, y2, s};
+                }
+            }
+        }
+    }
 
-                    if (x2 < 1 || x2 > 7 || y2 < 1 || y2 > 7) continue;
-                    if (b[x2][y2] != 0) continue;
+    // Sort by score descending (best moves first for better pruning)
+    sort(moves, moves + cnt, [](const ScoredMove& a, const ScoredMove& b) {
+        return a.score > b.score;
+    });
 
-                    int dist = max(abs(dx), abs(dy));
-                    if (dist == 1 || dist == 2) {
-                        moves.push_back(make_tuple(x1, y1, x2, y2));
+    return cnt;
+}
+
+// ------------------------------------------------------------
+// Evaluation: piece difference + capture potential
+// ------------------------------------------------------------
+int evaluate(int player) {
+    int opp = player ^ 3;
+    int my_cnt = 0, opp_cnt = 0;
+    int my_adj = 0, opp_adj = 0;
+
+    for (int i = 1; i <= 7; i++) {
+        for (int j = 1; j <= 7; j++) {
+            if (board[i][j] == player) {
+                my_cnt++;
+                // Count empty neighbors (expansion potential)
+                for (int d = 0; d < 8; d++) {
+                    int ni = i + dx[d], nj = j + dy[d];
+                    if (ni >= 1 && ni <= 7 && nj >= 1 && nj <= 7) {
+                        if (board[ni][nj] == opp) my_adj++;
+                    }
+                }
+            } else if (board[i][j] == opp) {
+                opp_cnt++;
+                for (int d = 0; d < 8; d++) {
+                    int ni = i + dx[d], nj = j + dy[d];
+                    if (ni >= 1 && ni <= 7 && nj >= 1 && nj <= 7) {
+                        if (board[ni][nj] == player) opp_adj++;
                     }
                 }
             }
         }
     }
 
-    return moves;
-}
+    // Terminal check
+    if (my_cnt == 0) return -10000;
+    if (opp_cnt == 0) return 10000;
 
-// ------------------------------------------------------------
-// Evaluation function
-// ------------------------------------------------------------
+    // Piece count is king in ATAXX
+    int score = (my_cnt - opp_cnt) * 100;
 
-int evaluate(int b[8][8], int player) {
-    int opp = player ^ 3;
+    // Capture potential: my pieces adjacent to opponent = offensive power
+    score += (my_adj - opp_adj) * 5;
 
-    // Check if game over
-    bool player_has_moves = !find_all_moves(b, player).empty();
-    bool opp_has_moves = !find_all_moves(b, opp).empty();
-
-    if (!player_has_moves && !opp_has_moves) {
-        int my_cnt = count_pieces(b, player);
-        int opp_cnt = count_pieces(b, opp);
-        if (my_cnt > opp_cnt) return 10000;
-        if (my_cnt < opp_cnt) return -10000;
-        return 0;
-    }
-
-    // 1. Piece count
-    int my_pieces = count_pieces(b, player);
-    int opp_pieces = count_pieces(b, opp);
-    int piece_score = my_pieces - opp_pieces;
-
-    // 2. Position value
-    int my_position = 0;
-    int opp_position = 0;
-    for (int i = 1; i <= 7; i++) {
-        for (int j = 1; j <= 7; j++) {
-            if (b[i][j] == player) {
-                my_position += POS_WEIGHT[i][j];
-            } else if (b[i][j] == opp) {
-                opp_position += POS_WEIGHT[i][j];
-            }
-        }
-    }
-    int position_score = my_position - opp_position;
-
-    // 3. Mobility (number of legal moves)
-    int my_mobility = find_all_moves(b, player).size();
-    int opp_mobility = find_all_moves(b, opp).size();
-    int mobility_score = my_mobility - opp_mobility;
-
-    // 4. Game phase detection: adjust weights based on total pieces
-    int total_pieces = my_pieces + opp_pieces;
-    int weight_piece, weight_position, weight_mobility;
-
-    if (total_pieces < 20) {
-        // Early game: mobility and position important
-        weight_piece = 1;
-        weight_position = 3;
-        weight_mobility = 5;
-    } else if (total_pieces < 35) {
-        // Mid game: balanced
-        weight_piece = 2;
-        weight_position = 2;
-        weight_mobility = 3;
-    } else {
-        // Late game: piece count most important
-        weight_piece = 5;
-        weight_position = 1;
-        weight_mobility = 1;
-    }
-
-    return weight_piece * piece_score +
-           weight_position * position_score +
-           weight_mobility * mobility_score;
+    return score;
 }
 
 // ------------------------------------------------------------
 // Negamax with Alpha-Beta pruning
 // ------------------------------------------------------------
+chrono::steady_clock::time_point search_start;
+int time_limit_ms;
+bool time_up;
 
-int negamax(int b[8][8], int depth, int alpha, int beta, int player) {
-    // Base case: depth 0 or game over
-    if (depth == 0) {
-        return evaluate(b, player);
+int negamax(int depth, int alpha, int beta, int player) {
+    node_count++;
+
+    // Time check every 4096 nodes
+    if ((node_count & 4095) == 0) {
+        auto now = chrono::steady_clock::now();
+        int elapsed = chrono::duration_cast<chrono::milliseconds>(now - search_start).count();
+        if (elapsed >= time_limit_ms) {
+            time_up = true;
+            return 0;
+        }
     }
 
-    vector<tuple<int,int,int,int>> moves = find_all_moves(b, player);
+    if (depth == 0) return evaluate(player);
 
-    // No moves available: pass to opponent
-    if (moves.empty()) {
-        int opp = player ^ 3;
-        vector<tuple<int,int,int,int>> opp_moves = find_all_moves(b, opp);
-        if (opp_moves.empty()) {
-            // Game over
-            return evaluate(b, player);
-        }
-        // Pass turn
-        return -negamax(b, depth - 1, -beta, -alpha, opp);
+    ScoredMove moves[200];
+    int n = gen_moves(moves, player);
+
+    if (n == 0) {
+        // No moves: check if opponent also has no moves
+        ScoredMove opp_moves[200];
+        int opp_n = gen_moves(opp_moves, player ^ 3);
+        if (opp_n == 0) return evaluate(player); // game over
+        // Pass: opponent plays
+        return -negamax(depth - 1, -beta, -alpha, player ^ 3);
     }
 
-    // Move ordering: sort by destination position weight (descending)
-    sort(moves.begin(), moves.end(), [](const auto& a, const auto& b) {
-        int x2a = get<2>(a), y2a = get<3>(a);
-        int x2b = get<2>(b), y2b = get<3>(b);
-        return POS_WEIGHT[x2a][y2a] > POS_WEIGHT[x2b][y2b];
-    });
+    for (int i = 0; i < n; i++) {
+        auto& m = moves[i];
+        make_move(m.x1, m.y1, m.x2, m.y2, player);
+        int score = -negamax(depth - 1, -beta, -alpha, player ^ 3);
+        undo_move(player);
 
-    // Search all moves
-    for (const auto& mv : moves) {
-        int x1 = get<0>(mv), y1 = get<1>(mv);
-        int x2 = get<2>(mv), y2 = get<3>(mv);
+        if (time_up) return 0;
 
-        // Simulate move on copy
-        int tmp[8][8];
-        copy_board(b, tmp);
-        simulate_move(tmp, x1, y1, x2, y2, player);
-
-        // Recursive call with negamax
-        int opp = player ^ 3;
-        int score = -negamax(tmp, depth - 1, -beta, -alpha, opp);
-
-        // Update alpha
-        if (score > alpha) {
-            alpha = score;
-        }
-
-        // Beta cutoff: pruning!
-        if (alpha >= beta) {
-            break;
-        }
+        if (score > alpha) alpha = score;
+        if (alpha >= beta) break;
     }
 
     return alpha;
 }
 
 // ------------------------------------------------------------
-// Find best move (root search)
+// Find best move with iterative deepening
 // ------------------------------------------------------------
+tuple<int, int, int, int> find_move(int my_time) {
+    // Time management
+    if (my_time > 30000) time_limit_ms = 800;
+    else if (my_time > 10000) time_limit_ms = 400;
+    else if (my_time > 3000) time_limit_ms = 150;
+    else time_limit_ms = 50;
 
-tuple<int,int,int,int> find_move() {
-    vector<tuple<int,int,int,int>> moves = find_all_moves(board, turn);
+    search_start = chrono::steady_clock::now();
+    time_up = false;
 
-    if (moves.empty()) {
-        // No moves: should not happen in normal game
-        return make_tuple(0, 0, 0, 0);
-    }
+    ScoredMove moves[200];
+    int n = gen_moves(moves, turn);
+    if (n == 0) return {-1, -1, -1, -1};
+    if (n == 1) return {moves[0].x1, moves[0].y1, moves[0].x2, moves[0].y2};
 
-    // Move ordering: sort by destination position weight
-    sort(moves.begin(), moves.end(), [](const auto& a, const auto& b) {
-        int x2a = get<2>(a), y2a = get<3>(a);
-        int x2b = get<2>(b), y2b = get<3>(b);
-        return POS_WEIGHT[x2a][y2a] > POS_WEIGHT[x2b][y2b];
-    });
+    int best_x1 = moves[0].x1, best_y1 = moves[0].y1;
+    int best_x2 = moves[0].x2, best_y2 = moves[0].y2;
 
-    int best_score = -INF;
-    tuple<int,int,int,int> best_move = moves[0];
+    // Iterative deepening
+    for (int depth = 1; depth <= 30; depth++) {
+        int best_score = -INF;
+        int cur_x1 = -1, cur_y1 = -1, cur_x2 = -1, cur_y2 = -1;
 
-    for (const auto& mv : moves) {
-        int x1 = get<0>(mv), y1 = get<1>(mv);
-        int x2 = get<2>(mv), y2 = get<3>(mv);
+        node_count = 0;
 
-        // Simulate move
-        int tmp[8][8];
-        copy_board(board, tmp);
-        simulate_move(tmp, x1, y1, x2, y2, turn);
+        for (int i = 0; i < n; i++) {
+            auto& m = moves[i];
+            make_move(m.x1, m.y1, m.x2, m.y2, turn);
+            int score = -negamax(depth - 1, -INF, -best_score, turn ^ 3);
+            undo_move(turn);
 
-        // Search with negamax
-        int opp = turn ^ 3;
-        int score = -negamax(tmp, MAX_DEPTH - 1, -INF, INF, opp);
+            if (time_up) break;
 
-        if (score > best_score) {
-            best_score = score;
-            best_move = mv;
+            if (score > best_score) {
+                best_score = score;
+                cur_x1 = m.x1; cur_y1 = m.y1;
+                cur_x2 = m.x2; cur_y2 = m.y2;
+
+                // Re-sort: put best move first for next iteration
+                if (i > 0) {
+                    ScoredMove tmp = moves[i];
+                    for (int j = i; j > 0; j--) moves[j] = moves[j-1];
+                    moves[0] = tmp;
+                }
+            }
         }
+
+        if (time_up) break;
+
+        // Completed this depth: update best
+        if (cur_x1 != -1) {
+            best_x1 = cur_x1; best_y1 = cur_y1;
+            best_x2 = cur_x2; best_y2 = cur_y2;
+        }
+
+        // If found a winning move, stop early
+        if (best_score >= 9000) break;
     }
 
-    return best_move;
+    return {best_x1, best_y1, best_x2, best_y2};
 }
 
 // ------------------------------------------------------------
-// Move application
+// Apply the player's move to the local board state.
 // ------------------------------------------------------------
-
 void apply_my_move(int x1, int y1, int x2, int y2) {
-    int dist = max(abs(x2 - x1), abs(y2 - y1));
-    assert(dist == 1 || dist == 2);
-    assert(board[x1][y1] == turn);
-    assert(board[x2][y2] == 0);
-
-    if (dist == 1) {
-        // Split
-        board[x2][y2] = turn;
-    } else {
-        // Jump
-        board[x1][y1] = 0;
-        board[x2][y2] = turn;
-    }
-
-    // Infect adjacent opponent pieces
-    int opp = turn ^ 3;
-    for (int d = 0; d < 8; d++) {
-        int nx = x2 + dx[d];
-        int ny = y2 + dy[d];
-        if (nx >= 1 && nx <= 7 && ny >= 1 && ny <= 7 && board[nx][ny] == opp) {
-            board[nx][ny] = turn;
-        }
+    if (x1 == -1 && y1 == -1 && x2 == -1 && y2 == -1) return;
+    int dist = max(abs(x1 - x2), abs(y1 - y2));
+    assert(1 <= x1 && x1 <= 7 && 1 <= y1 && y1 <= 7);
+    assert(1 <= x2 && x2 <= 7 && 1 <= y2 && y2 <= 7);
+    assert(1 <= dist && dist <= 2);
+    if (dist == 2) board[x1][y1] = 0;
+    board[x2][y2] = turn;
+    for (int i = 0; i < 8; i++) {
+        int nx = x2 + dx[i];
+        int ny = y2 + dy[i];
+        if (nx < 1 || nx > 7 || ny < 1 || ny > 7) continue;
+        if (board[nx][ny] == (turn ^ 3)) board[nx][ny] = turn;
     }
 }
 
+// ------------------------------------------------------------
+// Apply the opponent's move to the local board state.
+// ------------------------------------------------------------
 void apply_opp_move(int x1, int y1, int x2, int y2) {
+    if (x1 == -1 && y1 == -1 && x2 == -1 && y2 == -1) return;
     int opp = turn ^ 3;
-    int dist = max(abs(x2 - x1), abs(y2 - y1));
-    assert(dist == 1 || dist == 2);
-    assert(board[x1][y1] == opp);
-    assert(board[x2][y2] == 0);
-
-    if (dist == 1) {
-        // Split
-        board[x2][y2] = opp;
-    } else {
-        // Jump
-        board[x1][y1] = 0;
-        board[x2][y2] = opp;
-    }
-
-    // Infect adjacent my pieces
-    for (int d = 0; d < 8; d++) {
-        int nx = x2 + dx[d];
-        int ny = y2 + dy[d];
-        if (nx >= 1 && nx <= 7 && ny >= 1 && ny <= 7 && board[nx][ny] == turn) {
-            board[nx][ny] = opp;
-        }
+    int dist = max(abs(x1 - x2), abs(y1 - y2));
+    assert(1 <= x1 && x1 <= 7 && 1 <= y1 && y1 <= 7);
+    assert(1 <= x2 && x2 <= 7 && 1 <= y2 && y2 <= 7);
+    assert(1 <= dist && dist <= 2);
+    if (dist == 2) board[x1][y1] = 0;
+    board[x2][y2] = opp;
+    for (int i = 0; i < 8; i++) {
+        int nx = x2 + dx[i];
+        int ny = y2 + dy[i];
+        if (nx < 1 || nx > 7 || ny < 1 || ny > 7) continue;
+        if (board[nx][ny] == turn) board[nx][ny] = opp;
     }
 }
 
 // ------------------------------------------------------------
-// Main
+// Main event loop: handles protocol commands and moves.
 // ------------------------------------------------------------
-
 int main() {
-    // Initialize board: corners
-    board[1][1] = board[7][7] = 1;  // FIRST
-    board[1][7] = board[7][1] = 2;  // SECOND
-
+    board[1][1] = board[7][7] = 1;
+    board[1][7] = board[7][1] = 2;
     string line;
     while (getline(cin, line)) {
         istringstream in(line);
         string cmd;
         in >> cmd;
-
         if (cmd == "READY") {
+            string role;
             in >> role;
             turn = (role == "FIRST" ? 1 : 2);
             cout << "OK" << endl;
@@ -369,11 +362,9 @@ int main() {
         else if (cmd == "TURN") {
             int t1, t2;
             in >> t1 >> t2;
-
-            auto [x1, y1, x2, y2] = find_move();
+            auto [x1, y1, x2, y2] = find_move(t1);
             apply_my_move(x1, y1, x2, y2);
-
-            cout << "MOVE " << x1 << " " << y1 << " " << x2 << " " << y2 << endl;
+            cout << "MOVE " << x1 << ' ' << y1 << ' ' << x2 << ' ' << y2 << endl;
         }
         else if (cmd == "OPP") {
             int x1, y1, x2, y2, t;
@@ -384,6 +375,5 @@ int main() {
             break;
         }
     }
-
     return 0;
 }

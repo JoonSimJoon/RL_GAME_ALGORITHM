@@ -1,67 +1,63 @@
-/*
- * ==== Ataxx ID-TT-PVS Agent ====
- *
- * Iterative Deepening + Transposition Table + Principal Variation Search
- *
- * Strategy:
- * 1. Zobrist Hashing for board positions
- * 2. Transposition Table (TT) with PV/CUT/ALL flags
- * 3. Principal Variation Search (PVS) with null window
- * 4. Iterative Deepening with time management
- * 5. Move ordering using TT best move
- * 6. Evaluation: piece_diff + mobility * 0.1
- */
-
-#include <iostream>
-#include <vector>
-#include <unordered_map>
-#include <tuple>
-#include <algorithm>
-#include <chrono>
-#include <cassert>
-#include <cstdint>
+#include <bits/stdc++.h>
 using namespace std;
 
-// ----------------------------------------------------------------------------
-// Global State
-// ----------------------------------------------------------------------------
-
+// ---- Global Board State ----
 int board[8][8];
 int turn;
-
 const int dx[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
 const int dy[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
+const int INF = 1000000;
 
-const int FIRST = 1;
-const int SECOND = 2;
-const double INF = 1e9;
-
-// TT Flags
-const int PV_NODE = 0;   // Exact value
-const int CUT_NODE = 1;  // Lower bound (beta cutoff)
-const int ALL_NODE = 2;  // Upper bound (alpha cutoff)
-
-// ----------------------------------------------------------------------------
-// Zobrist Hashing
-// ----------------------------------------------------------------------------
-
-uint64_t zobrist[8][8][3];  // [row][col][piece_type] (0=empty, 1=FIRST, 2=SECOND)
+// ---- Zobrist Hashing ----
+uint64_t zobrist[8][8][3]; // [row][col][piece: 0=empty, 1=FIRST, 2=SECOND]
 uint64_t board_hash;
 
-uint64_t xorshift64(uint64_t x) {
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    return x;
-}
+// ---- Transposition Table ----
+const int PV_NODE = 0, CUT_NODE = 1, ALL_NODE = 2;
+struct TTEntry {
+    int best_x1, best_y1, best_x2, best_y2;
+    int flag, depth, value;
+};
+unordered_map<uint64_t, TTEntry> tt;
 
+// ---- Make/Undo Stack ----
+struct UndoInfo {
+    int x1, y1, x2, y2, dist;
+    int infected[8][2];
+    int infected_cnt;
+};
+UndoInfo undo_stack[128];
+int undo_top = 0;
+int current_player;
+
+// ---- Move Ordering ----
+struct ScoredMove {
+    int x1, y1, x2, y2, score;
+    bool operator<(const ScoredMove& other) const {
+        return score > other.score; // descending
+    }
+};
+
+// ---- Time Management ----
+chrono::steady_clock::time_point search_start;
+int time_limit_ms;
+bool time_up;
+int node_count;
+
+// ---- Zobrist Initialization ----
 void init_zobrist() {
-    uint64_t seed = 987654321;
+    uint64_t seed = 987654321ULL;
+    auto xorshift64 = [&]() {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        return seed;
+    };
+
     for (int i = 1; i <= 7; i++) {
         for (int j = 1; j <= 7; j++) {
-            for (int piece = 0; piece < 3; piece++) {
-                seed = xorshift64(seed);
-                zobrist[i][j][piece] = seed;
+            for (int p = 0; p <= 2; p++) {
+                zobrist[i][j][p] = xorshift64();
             }
         }
     }
@@ -71,252 +67,271 @@ uint64_t compute_hash() {
     uint64_t h = 0;
     for (int i = 1; i <= 7; i++) {
         for (int j = 1; j <= 7; j++) {
-            h ^= zobrist[i][j][board[i][j]];
+            if (board[i][j] != 0) {
+                h ^= zobrist[i][j][board[i][j]];
+            }
         }
     }
     return h;
 }
 
-// ----------------------------------------------------------------------------
-// Transposition Table
-// ----------------------------------------------------------------------------
-
-struct TTEntry {
-    tuple<int,int,int,int> best_move;
-    int flag;
-    int depth;
-    double value;
-
-    TTEntry() : best_move(-1,-1,-1,-1), flag(0), depth(0), value(0.0) {}
-    TTEntry(tuple<int,int,int,int> bm, int f, int d, double v)
-        : best_move(bm), flag(f), depth(d), value(v) {}
-};
-
-unordered_map<uint64_t, TTEntry> tt;
-
-// ----------------------------------------------------------------------------
-// Move History (for undo)
-// ----------------------------------------------------------------------------
-
-// Each entry: (move, distance, infected_cells)
-vector<tuple<tuple<int,int,int,int>, int, vector<pair<int,int>>>> move_history;
-
-// ----------------------------------------------------------------------------
-// Search State
-// ----------------------------------------------------------------------------
-
-int current_player;  // Player whose turn it is during search
-
-// ----------------------------------------------------------------------------
-// Move Generation
-// ----------------------------------------------------------------------------
-
-bool is_valid(int x, int y) {
-    if (x < 1 || x > 7 || y < 1 || y > 7) return false;
-    if (x == 4 && y == 4) return false;  // Wall at center
-    return true;
+// ---- Move Application ----
+void apply_my_move(int x1, int y1, int x2, int y2) {
+    assert(board[x2][y2] == 0);
+    board[x2][y2] = turn;
+    int dist = max(abs(x2 - x1), abs(y2 - y1));
+    if (dist == 2) {
+        board[x1][y1] = 0;
+    }
+    for (int d = 0; d < 8; d++) {
+        int nx = x2 + dx[d], ny = y2 + dy[d];
+        if (nx >= 1 && nx <= 7 && ny >= 1 && ny <= 7) {
+            if (board[nx][ny] == (turn ^ 3)) {
+                board[nx][ny] = turn;
+            }
+        }
+    }
 }
 
-vector<tuple<int,int,int,int>> find_all_moves(int player) {
-    vector<tuple<int,int,int,int>> moves;
+void apply_opp_move(int x1, int y1, int x2, int y2) {
+    int opp = turn ^ 3;
+    assert(board[x2][y2] == 0);
+    board[x2][y2] = opp;
+    int dist = max(abs(x2 - x1), abs(y2 - y1));
+    if (dist == 2) {
+        board[x1][y1] = 0;
+    }
+    for (int d = 0; d < 8; d++) {
+        int nx = x2 + dx[d], ny = y2 + dy[d];
+        if (nx >= 1 && nx <= 7 && ny >= 1 && ny <= 7) {
+            if (board[nx][ny] == turn) {
+                board[nx][ny] = opp;
+            }
+        }
+    }
+}
 
-    for (int x = 1; x <= 7; x++) {
-        for (int y = 1; y <= 7; y++) {
-            if (board[x][y] != player) continue;
+// ---- Make/Undo with Hash Update ----
+void make_move(int x1, int y1, int x2, int y2, int player) {
+    UndoInfo& u = undo_stack[undo_top++];
+    u.x1 = x1; u.y1 = y1; u.x2 = x2; u.y2 = y2;
+    u.dist = max(abs(x2 - x1), abs(y2 - y1));
+    u.infected_cnt = 0;
 
-            // Try all destinations within distance 2
-            for (int d_x = -2; d_x <= 2; d_x++) {
-                for (int d_y = -2; d_y <= 2; d_y++) {
-                    if (d_x == 0 && d_y == 0) continue;
-                    int dist = max(abs(d_x), abs(d_y));
-                    if (dist > 2) continue;
+    int opp = player ^ 3;
 
-                    int nx = x + d_x;
-                    int ny = y + d_y;
+    // Place piece at destination
+    board_hash ^= zobrist[x2][y2][0];
+    board_hash ^= zobrist[x2][y2][player];
+    board[x2][y2] = player;
 
-                    if (is_valid(nx, ny) && board[nx][ny] == 0) {
-                        moves.push_back({x, y, nx, ny});
+    // Remove from source if jump
+    if (u.dist == 2) {
+        board_hash ^= zobrist[x1][y1][player];
+        board_hash ^= zobrist[x1][y1][0];
+        board[x1][y1] = 0;
+    }
+
+    // Infect adjacent opponents
+    for (int d = 0; d < 8; d++) {
+        int nx = x2 + dx[d], ny = y2 + dy[d];
+        if (nx >= 1 && nx <= 7 && ny >= 1 && ny <= 7) {
+            if (board[nx][ny] == opp) {
+                board_hash ^= zobrist[nx][ny][opp];
+                board_hash ^= zobrist[nx][ny][player];
+                board[nx][ny] = player;
+                u.infected[u.infected_cnt][0] = nx;
+                u.infected[u.infected_cnt][1] = ny;
+                u.infected_cnt++;
+            }
+        }
+    }
+
+    current_player = opp;
+}
+
+void undo_move() {
+    assert(undo_top > 0);
+    UndoInfo& u = undo_stack[--undo_top];
+
+    int opp = current_player;
+    int player = opp ^ 3;
+
+    // Restore infected pieces
+    for (int i = 0; i < u.infected_cnt; i++) {
+        int nx = u.infected[i][0];
+        int ny = u.infected[i][1];
+        board_hash ^= zobrist[nx][ny][player];
+        board_hash ^= zobrist[nx][ny][opp];
+        board[nx][ny] = opp;
+    }
+
+    // Restore source if jump
+    if (u.dist == 2) {
+        board_hash ^= zobrist[u.x1][u.y1][0];
+        board_hash ^= zobrist[u.x1][u.y1][player];
+        board[u.x1][u.y1] = player;
+    }
+
+    // Remove from destination
+    board_hash ^= zobrist[u.x2][u.y2][player];
+    board_hash ^= zobrist[u.x2][u.y2][0];
+    board[u.x2][u.y2] = 0;
+
+    current_player = player;
+}
+
+// ---- Move Generation with Ordering ----
+int gen_moves(ScoredMove* moves, int player, TTEntry* tt_hint = nullptr) {
+    int cnt = 0;
+    int opp = player ^ 3;
+
+    for (int i = 1; i <= 7; i++) {
+        for (int j = 1; j <= 7; j++) {
+            if (board[i][j] == player) {
+                for (int di = -2; di <= 2; di++) {
+                    for (int dj = -2; dj <= 2; dj++) {
+                        if (di == 0 && dj == 0) continue;
+                        int ni = i + di, nj = j + dj;
+                        if (ni >= 1 && ni <= 7 && nj >= 1 && nj <= 7) {
+                            if (board[ni][nj] == 0) {
+                                int dist = max(abs(di), abs(dj));
+                                int captures = 0;
+                                for (int d = 0; d < 8; d++) {
+                                    int nx = ni + dx[d], ny = nj + dy[d];
+                                    if (nx >= 1 && nx <= 7 && ny >= 1 && ny <= 7) {
+                                        if (board[nx][ny] == opp) {
+                                            captures++;
+                                        }
+                                    }
+                                }
+
+                                int score = captures * 10 + (dist == 1 ? 5 : 0);
+
+                                // TT move bonus
+                                if (tt_hint && tt_hint->best_x1 == i && tt_hint->best_y1 == j &&
+                                    tt_hint->best_x2 == ni && tt_hint->best_y2 == nj) {
+                                    score += 1000;
+                                }
+
+                                moves[cnt++] = {i, j, ni, nj, score};
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    return moves;
+    sort(moves, moves + cnt);
+    return cnt;
 }
 
-// ----------------------------------------------------------------------------
-// Make/Undo Move (for search)
-// ----------------------------------------------------------------------------
+// ---- Evaluation ----
+int evaluate(int player) {
+    int my_cnt = 0, opp_cnt = 0;
+    int my_adj = 0, opp_adj = 0;
+    int opp = player ^ 3;
 
-void make_move(tuple<int,int,int,int> move) {
-    auto [x1, y1, x2, y2] = move;
-    int player = current_player;
-    int opp = (player == FIRST) ? SECOND : FIRST;
-
-    int dist = max(abs(x2 - x1), abs(y2 - y1));
-
-    // Update hash: place piece at destination
-    board_hash ^= zobrist[x2][y2][0];
-    board_hash ^= zobrist[x2][y2][player];
-    board[x2][y2] = player;
-
-    // If jump (distance 2), remove source
-    if (dist == 2) {
-        board_hash ^= zobrist[x1][y1][player];
-        board_hash ^= zobrist[x1][y1][0];
-        board[x1][y1] = 0;
-    }
-
-    // Infect adjacent opponent pieces
-    vector<pair<int,int>> infected;
-    for (int d = 0; d < 8; d++) {
-        int nx = x2 + dx[d];
-        int ny = y2 + dy[d];
-        if (is_valid(nx, ny) && board[nx][ny] == opp) {
-            infected.push_back({nx, ny});
-            board_hash ^= zobrist[nx][ny][opp];
-            board_hash ^= zobrist[nx][ny][player];
-            board[nx][ny] = player;
-        }
-    }
-
-    move_history.push_back({move, dist, infected});
-    current_player = opp;
-}
-
-void undo_move() {
-    auto [move, dist, infected] = move_history.back();
-    move_history.pop_back();
-    auto [x1, y1, x2, y2] = move;
-
-    // Switch back to previous player
-    current_player = (current_player == FIRST) ? SECOND : FIRST;
-    int player = current_player;
-    int opp = (player == FIRST) ? SECOND : FIRST;
-
-    // Remove piece from destination
-    board_hash ^= zobrist[x2][y2][player];
-    board_hash ^= zobrist[x2][y2][0];
-    board[x2][y2] = 0;
-
-    // If jump, restore source
-    if (dist == 2) {
-        board_hash ^= zobrist[x1][y1][0];
-        board_hash ^= zobrist[x1][y1][player];
-        board[x1][y1] = player;
-    }
-
-    // Restore infected pieces
-    for (auto [nx, ny] : infected) {
-        board_hash ^= zobrist[nx][ny][player];
-        board_hash ^= zobrist[nx][ny][opp];
-        board[nx][ny] = opp;
-    }
-}
-
-// ----------------------------------------------------------------------------
-// Evaluation
-// ----------------------------------------------------------------------------
-
-pair<int,int> count_pieces() {
-    int first_count = 0, second_count = 0;
     for (int i = 1; i <= 7; i++) {
         for (int j = 1; j <= 7; j++) {
-            if (board[i][j] == FIRST) first_count++;
-            else if (board[i][j] == SECOND) second_count++;
+            if (board[i][j] == player) {
+                my_cnt++;
+                // Count adjacent to opponent
+                for (int d = 0; d < 8; d++) {
+                    int nx = i + dx[d], ny = j + dy[d];
+                    if (nx >= 1 && nx <= 7 && ny >= 1 && ny <= 7) {
+                        if (board[nx][ny] == opp) {
+                            my_adj++;
+                        }
+                    }
+                }
+            } else if (board[i][j] == opp) {
+                opp_cnt++;
+                // Count adjacent to player
+                for (int d = 0; d < 8; d++) {
+                    int nx = i + dx[d], ny = j + dy[d];
+                    if (nx >= 1 && nx <= 7 && ny >= 1 && ny <= 7) {
+                        if (board[nx][ny] == player) {
+                            opp_adj++;
+                        }
+                    }
+                }
+            }
         }
     }
-    return {first_count, second_count};
+
+    if (my_cnt == 0) return -100000;
+    if (opp_cnt == 0) return 100000;
+
+    return (my_cnt - opp_cnt) * 100 + (my_adj - opp_adj) * 5;
 }
 
-double evaluate() {
-    auto [first_count, second_count] = count_pieces();
-    int mobility = find_all_moves(current_player).size();
+// ---- PVS Search ----
+int pvs(int depth, int alpha, int beta) {
+    node_count++;
 
-    int piece_diff;
-    if (current_player == FIRST) {
-        piece_diff = first_count - second_count;
-    } else {
-        piece_diff = second_count - first_count;
+    // Time check every 4096 nodes
+    if ((node_count & 4095) == 0) {
+        auto now = chrono::steady_clock::now();
+        int elapsed = chrono::duration_cast<chrono::milliseconds>(now - search_start).count();
+        if (elapsed >= time_limit_ms) {
+            time_up = true;
+        }
     }
 
-    return piece_diff + mobility * 0.1;
-}
-
-bool is_terminal() {
-    auto [first_count, second_count] = count_pieces();
-    if (first_count == 0 || second_count == 0) return true;
-    if (first_count + second_count == 48) return true;
-    return false;
-}
-
-// ----------------------------------------------------------------------------
-// Principal Variation Search
-// ----------------------------------------------------------------------------
-
-pair<double, tuple<int,int,int,int>> pvs(
-    int depth, double alpha, double beta,
-    chrono::steady_clock::time_point start_time, int time_limit) {
-
-    // Time check
-    auto now = chrono::steady_clock::now();
-    auto elapsed = chrono::duration_cast<chrono::milliseconds>(now - start_time).count();
-    if (elapsed > time_limit * 0.95) {
-        return {evaluate(), {-1,-1,-1,-1}};
-    }
-
-    double alpha_original = alpha;
+    if (time_up) return 0;
 
     // TT lookup
-    tuple<int,int,int,int> tt_move = {-1,-1,-1,-1};
-    if (tt.count(board_hash)) {
-        tt_move = tt[board_hash].best_move;
+    TTEntry* tt_entry = nullptr;
+    auto it = tt.find(board_hash);
+    if (it != tt.end()) {
+        tt_entry = &it->second;
+        if (tt_entry->depth >= depth) {
+            if (tt_entry->flag == PV_NODE) {
+                return tt_entry->value;
+            } else if (tt_entry->flag == CUT_NODE) {
+                alpha = max(alpha, tt_entry->value);
+            } else if (tt_entry->flag == ALL_NODE) {
+                beta = min(beta, tt_entry->value);
+            }
+            if (alpha >= beta) {
+                return tt_entry->value;
+            }
+        }
     }
 
     // Terminal or depth 0
-    if (depth == 0 || is_terminal()) {
-        return {evaluate(), {-1,-1,-1,-1}};
+    ScoredMove moves[256];
+    int n = gen_moves(moves, current_player, tt_entry);
+
+    if (n == 0 || depth == 0) {
+        return evaluate(current_player);
     }
 
-    auto moves = find_all_moves(current_player);
+    int best_value = -INF;
+    int alpha_original = alpha;
+    ScoredMove best_move = moves[0];
 
-    // No moves (pass)
-    if (moves.empty()) {
-        return {evaluate(), {-1,-1,-1,-1}};
-    }
+    for (int i = 0; i < n; i++) {
+        make_move(moves[i].x1, moves[i].y1, moves[i].x2, moves[i].y2, current_player);
 
-    // Move ordering: TT move first
-    auto it = find(moves.begin(), moves.end(), tt_move);
-    if (it != moves.end()) {
-        moves.erase(it);
-        moves.insert(moves.begin(), tt_move);
-    }
-
-    double best_value = -INF;
-    tuple<int,int,int,int> best_move = {-1,-1,-1,-1};
-
-    for (size_t i = 0; i < moves.size(); i++) {
-        make_move(moves[i]);
-
-        double value;
+        int value;
         if (i == 0) {
             // Full window search
-            auto [v, _] = pvs(depth - 1, -beta, -alpha, start_time, time_limit);
-            value = -v;
+            value = -pvs(depth - 1, -beta, -alpha);
         } else {
             // Null window search
-            auto [v, _] = pvs(depth - 1, -alpha - 1, -alpha, start_time, time_limit);
-            value = -v;
-
-            // Re-search if necessary
-            if (alpha < value && value < beta) {
-                auto [v2, _] = pvs(depth - 1, -beta, -value, start_time, time_limit);
-                value = -v2;
+            value = -pvs(depth - 1, -alpha - 1, -alpha);
+            // Re-search if in window
+            if (!time_up && alpha < value && value < beta) {
+                value = -pvs(depth - 1, -beta, -value);
             }
         }
 
         undo_move();
+
+        if (time_up) return 0;
 
         if (value > best_value) {
             best_value = value;
@@ -324,179 +339,144 @@ pair<double, tuple<int,int,int,int>> pvs(
         }
 
         alpha = max(alpha, value);
-        if (alpha >= beta) break;  // Beta cutoff
+        if (alpha >= beta) {
+            break; // Beta cutoff
+        }
     }
 
     // Store in TT
-    int flag;
-    if (best_value <= alpha_original) flag = ALL_NODE;
-    else if (best_value >= beta) flag = CUT_NODE;
-    else flag = PV_NODE;
+    TTEntry new_entry;
+    new_entry.best_x1 = best_move.x1;
+    new_entry.best_y1 = best_move.y1;
+    new_entry.best_x2 = best_move.x2;
+    new_entry.best_y2 = best_move.y2;
+    new_entry.depth = depth;
+    new_entry.value = best_value;
 
-    if (!tt.count(board_hash) || tt[board_hash].depth <= depth) {
-        tt[board_hash] = TTEntry(best_move, flag, depth, best_value);
+    if (best_value <= alpha_original) {
+        new_entry.flag = ALL_NODE;
+    } else if (best_value >= beta) {
+        new_entry.flag = CUT_NODE;
+    } else {
+        new_entry.flag = PV_NODE;
     }
 
-    return {best_value, best_move};
+    tt[board_hash] = new_entry;
+
+    return best_value;
 }
 
-// ----------------------------------------------------------------------------
-// Iterative Deepening
-// ----------------------------------------------------------------------------
+// ---- Iterative Deepening ----
+ScoredMove find_move(int my_time) {
+    // Time management
+    if (my_time > 30000) {
+        time_limit_ms = 800;
+    } else if (my_time > 10000) {
+        time_limit_ms = 400;
+    } else if (my_time > 3000) {
+        time_limit_ms = 150;
+    } else {
+        time_limit_ms = 50;
+    }
 
-tuple<int,int,int,int> iterative_deepening(int time_limit) {
-    auto start_time = chrono::steady_clock::now();
-    tuple<int,int,int,int> best_move = {-1,-1,-1,-1};
+    search_start = chrono::steady_clock::now();
+    time_up = false;
+    node_count = 0;
+    current_player = turn;
+    board_hash = compute_hash();
+    undo_top = 0;
 
-    for (int depth = 1; depth < 50; depth++) {
+    ScoredMove root_moves[256];
+    int n = gen_moves(root_moves, turn);
+
+    if (n == 0) {
+        return {0, 0, 0, 0, 0};
+    }
+
+    ScoredMove best_move = root_moves[0];
+
+    for (int depth = 1; depth <= 50; depth++) {
         auto now = chrono::steady_clock::now();
-        auto elapsed = chrono::duration_cast<chrono::milliseconds>(now - start_time).count();
-        if (elapsed > time_limit * 0.85) break;
-
-        auto [value, move] = pvs(depth, -INF, INF, start_time, time_limit);
-
-        if (get<0>(move) != -1) {
-            best_move = move;
-        } else {
+        int elapsed = chrono::duration_cast<chrono::milliseconds>(now - search_start).count();
+        if (elapsed > time_limit_ms * 85 / 100) {
             break;
         }
+
+        int best_score = -INF;
+        int best_idx = 0;
+
+        for (int i = 0; i < n; i++) {
+            make_move(root_moves[i].x1, root_moves[i].y1, root_moves[i].x2, root_moves[i].y2, turn);
+
+            int score = -pvs(depth - 1, -INF, -best_score);
+
+            undo_move();
+
+            if (time_up) break;
+
+            root_moves[i].score = score;
+
+            if (score > best_score) {
+                best_score = score;
+                best_idx = i;
+            }
+        }
+
+        if (time_up) break;
+
+        // Move best to front
+        if (best_idx > 0) {
+            swap(root_moves[0], root_moves[best_idx]);
+        }
+
+        best_move = root_moves[0];
+
+        cerr << "Depth " << depth << " completed, score=" << best_score
+             << " nodes=" << node_count << endl;
     }
 
     return best_move;
 }
 
-// ----------------------------------------------------------------------------
-// Time Management
-// ----------------------------------------------------------------------------
-
-int calculate_time_limit(int my_time) {
-    if (my_time > 60000) return 50;
-    else if (my_time > 20000) return 150;
-    else return 10;
-}
-
-// ----------------------------------------------------------------------------
-// Protocol Functions
-// ----------------------------------------------------------------------------
-
-void apply_my_move(int x1, int y1, int x2, int y2) {
-    assert(x1 >= 1 && x1 <= 7 && y1 >= 1 && y1 <= 7);
-    assert(x2 >= 1 && x2 <= 7 && y2 >= 1 && y2 <= 7);
-    assert(board[x1][y1] == turn);
-    assert(board[x2][y2] == 0);
-
-    int dist = max(abs(x2 - x1), abs(y2 - y1));
-    board[x2][y2] = turn;
-
-    if (dist == 2) {
-        board[x1][y1] = 0;
-    }
-
-    int opp = turn ^ 3;
-    for (int d = 0; d < 8; d++) {
-        int nx = x2 + dx[d];
-        int ny = y2 + dy[d];
-        if (is_valid(nx, ny) && board[nx][ny] == opp) {
-            board[nx][ny] = turn;
-        }
-    }
-}
-
-void apply_opp_move(int x1, int y1, int x2, int y2) {
-    assert(x1 >= 1 && x1 <= 7 && y1 >= 1 && y1 <= 7);
-    assert(x2 >= 1 && x2 <= 7 && y2 >= 1 && y2 <= 7);
-
-    int opp = turn ^ 3;
-    assert(board[x1][y1] == opp);
-    assert(board[x2][y2] == 0);
-
-    int dist = max(abs(x2 - x1), abs(y2 - y1));
-    board[x2][y2] = opp;
-
-    if (dist == 2) {
-        board[x1][y1] = 0;
-    }
-
-    for (int d = 0; d < 8; d++) {
-        int nx = x2 + dx[d];
-        int ny = y2 + dy[d];
-        if (is_valid(nx, ny) && board[nx][ny] == turn) {
-            board[nx][ny] = opp;
-        }
-    }
-}
-
-tuple<int,int,int,int> find_move() {
-    // Synchronize current_player with global turn for search
-    current_player = turn;
-    board_hash = compute_hash();
-    move_history.clear();
-
-    // Time is read from context (global variable set by main)
-    int time_limit = calculate_time_limit(100000);  // Default
-    return iterative_deepening(time_limit);
-}
-
-// ----------------------------------------------------------------------------
-// Main
-// ----------------------------------------------------------------------------
-
+// ---- Main ----
 int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
     init_zobrist();
 
-    // Initialize board
-    for (int i = 0; i < 8; i++) {
-        for (int j = 0; j < 8; j++) {
-            board[i][j] = 0;
+    memset(board, 0, sizeof(board));
+    board[1][1] = board[7][7] = 1;
+    board[1][7] = board[7][1] = 2;
+
+    string line;
+    while (getline(cin, line)) {
+        istringstream in(line);
+        string cmd;
+        in >> cmd;
+
+        if (cmd == "FIRST") {
+            turn = 1;
+            ScoredMove m = find_move(100000);
+            cout << m.x1 << " " << m.y1 << " " << m.x2 << " " << m.y2 << endl;
+            apply_my_move(m.x1, m.y1, m.x2, m.y2);
         }
-    }
-
-    string cmd;
-    while (cin >> cmd) {
-        if (cmd == "READY") {
-            string position;
-            cin >> position;
-
-            // Initial setup
-            board[1][1] = FIRST;
-            board[7][7] = FIRST;
-            board[1][7] = SECOND;
-            board[7][1] = SECOND;
-
-            if (position == "FIRST") {
-                turn = FIRST;
-            } else {
-                turn = SECOND;
-            }
-
-            cout << "OK" << endl;
-
-        } else if (cmd == "TURN") {
-            int my_time, opp_time;
-            cin >> my_time >> opp_time;
-
-            // Update search state
-            current_player = turn;
-            board_hash = compute_hash();
-            move_history.clear();
-
-            int time_limit = calculate_time_limit(my_time);
-            auto best_move = iterative_deepening(time_limit);
-
-            if (get<0>(best_move) != -1) {
-                auto [x1, y1, x2, y2] = best_move;
-                cout << "MOVE " << x1 << " " << y1 << " " << x2 << " " << y2 << endl;
-                apply_my_move(x1, y1, x2, y2);
-            } else {
-                cout << "PASS" << endl;
-            }
-
-        } else if (cmd == "OPP") {
+        else if (cmd == "SECOND") {
+            turn = 2;
+        }
+        else if (cmd == "THIRD") {
+            turn = 2;
+        }
+        else if (cmd == "OPP") {
             int x1, y1, x2, y2, t;
-            cin >> x1 >> y1 >> x2 >> y2 >> t;
+            in >> x1 >> y1 >> x2 >> y2 >> t;
             apply_opp_move(x1, y1, x2, y2);
 
-        } else if (cmd == "FINISH") {
+            ScoredMove m = find_move(t);
+            cout << m.x1 << " " << m.y1 << " " << m.x2 << " " << m.y2 << endl;
+            apply_my_move(m.x1, m.y1, m.x2, m.y2);
+        }
+        else if (cmd == "END") {
             break;
         }
     }
