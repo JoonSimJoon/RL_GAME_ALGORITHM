@@ -16,6 +16,7 @@ from rl_lab.utils.logging import save_json, write_csv
 from rl_lab.utils.networks import build_mlp
 from rl_lab.utils.plotting import plot_training_curve
 from rl_lab.utils.seed import set_global_seed
+from rl_lab.utils.video import save_frames
 
 
 class ReplayBuffer:
@@ -131,18 +132,28 @@ class DQNAlgorithm(RLAlgorithm):
         num_episodes: int = 10,
         seed: int | None = None,
         render: bool = False,
+        record_path: Path | None = None,
+        fps: int = 30,
     ) -> dict[str, Any]:
         self.load(checkpoint_path)
         assert self.q_network is not None
         eval_seed = self.config["seed"] if seed is None else seed
-        env = make_env(self.env_spec, seed=eval_seed, render=render, env_kwargs=self.config.get("env_kwargs"))
+        env_kwargs = dict(self.config.get("env_kwargs", {}))
+        if record_path is not None:
+            env_kwargs["render_mode"] = "rgb_array"
+        env = make_env(self.env_spec, seed=eval_seed, render=render, env_kwargs=env_kwargs)
         returns: list[float] = []
         lengths: list[int] = []
+        recorded_frames = []
 
         try:
             for episode in range(num_episodes):
                 observation, _ = env.reset(seed=eval_seed + episode)
                 observation = to_numpy_observation(observation)
+                if record_path is not None and episode == 0:
+                    frame = env.render()
+                    if frame is not None:
+                        recorded_frames.append(frame)
                 terminated = False
                 truncated = False
                 episode_return = 0.0
@@ -151,6 +162,10 @@ class DQNAlgorithm(RLAlgorithm):
                 while not (terminated or truncated):
                     action = self._select_action(observation, epsilon=0.0)
                     next_observation, reward, terminated, truncated, _ = env.step(action)
+                    if record_path is not None and episode == 0:
+                        frame = env.render()
+                        if frame is not None:
+                            recorded_frames.append(frame)
                     observation = to_numpy_observation(next_observation)
                     episode_return += float(reward)
                     steps += 1
@@ -159,6 +174,9 @@ class DQNAlgorithm(RLAlgorithm):
                 lengths.append(steps)
         finally:
             env.close()
+
+        if record_path is not None:
+            save_frames(record_path, recorded_frames, fps=fps)
 
         return {
             "avg_return": float(np.mean(returns)) if returns else 0.0,

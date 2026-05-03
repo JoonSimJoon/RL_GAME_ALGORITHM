@@ -11,6 +11,7 @@ from rl_lab.envs.factory import make_env
 from rl_lab.utils.logging import save_json, write_csv
 from rl_lab.utils.plotting import plot_training_curve
 from rl_lab.utils.seed import set_global_seed
+from rl_lab.utils.video import save_frames
 
 
 class QLearningAlgorithm(RLAlgorithm):
@@ -47,17 +48,27 @@ class QLearningAlgorithm(RLAlgorithm):
         num_episodes: int = 10,
         seed: int | None = None,
         render: bool = False,
+        record_path: Path | None = None,
+        fps: int = 30,
     ) -> dict[str, Any]:
         self.load(checkpoint_path)
         eval_seed = self.config["seed"] if seed is None else seed
-        env = make_env(self.env_spec, seed=eval_seed, render=render, env_kwargs=self.config.get("env_kwargs"))
+        env_kwargs = dict(self.config.get("env_kwargs", {}))
+        if record_path is not None:
+            env_kwargs["render_mode"] = "rgb_array"
+        env = make_env(self.env_spec, seed=eval_seed, render=render, env_kwargs=env_kwargs)
         returns: list[float] = []
         lengths: list[int] = []
         successes = 0
+        recorded_frames = []
 
         try:
             for episode in range(num_episodes):
                 state, _ = env.reset(seed=eval_seed + episode)
+                if record_path is not None and episode == 0:
+                    frame = env.render()
+                    if frame is not None:
+                        recorded_frames.append(frame)
                 done = False
                 truncated = False
                 episode_return = 0.0
@@ -66,6 +77,10 @@ class QLearningAlgorithm(RLAlgorithm):
                 while not (done or truncated):
                     action = self._greedy_action(int(state))
                     next_state, reward, done, truncated, _ = env.step(action)
+                    if record_path is not None and episode == 0:
+                        frame = env.render()
+                        if frame is not None:
+                            recorded_frames.append(frame)
                     state = next_state
                     episode_return += float(reward)
                     steps += 1
@@ -76,6 +91,9 @@ class QLearningAlgorithm(RLAlgorithm):
                     successes += 1
         finally:
             env.close()
+
+        if record_path is not None:
+            save_frames(record_path, recorded_frames, fps=fps)
 
         return {
             "avg_return": float(np.mean(returns)) if returns else 0.0,

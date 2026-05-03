@@ -1,0 +1,27 @@
+env: frozenlake
+algo: q_learning
+seed: 42
+device: cpu
+train_episodes: 6000
+eval_episodes: 300
+eval_interval: 300
+plot_window: 150
+
+env_kwargs:
+  is_slippery: false
+  desc:
+    - "SFFFF"
+    - "FHFHF"
+    - "FFFHF"
+    - "HFFFF"
+    - "FFFHG"
+
+algo_params:
+  alpha: 0.1
+  gamma: 0.99
+  epsilon_start: 1.0
+  epsilon_end: 0.02
+  epsilon_decay: 0.999
+
+network:
+  hidden_sizes: []

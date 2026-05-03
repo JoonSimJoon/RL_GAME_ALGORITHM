@@ -10,7 +10,9 @@ def make_env(env_spec, seed: int | None = None, render: bool = False, env_kwargs
     if env_kwargs:
         kwargs.update(env_kwargs)
 
-    render_mode = "human" if render else None
+    render_mode = kwargs.pop("render_mode", None)
+    if render_mode is None:
+        render_mode = "human" if render else None
     if render_mode is not None:
         kwargs["render_mode"] = render_mode
 

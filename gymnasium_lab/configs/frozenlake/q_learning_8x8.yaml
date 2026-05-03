@@ -1,0 +1,22 @@
+env: frozenlake
+algo: q_learning
+seed: 42
+device: cpu
+train_episodes: 10000
+eval_episodes: 300
+eval_interval: 500
+plot_window: 200
+
+env_kwargs:
+  is_slippery: false
+  map_name: 8x8
+
+algo_params:
+  alpha: 0.1
+  gamma: 0.99
+  epsilon_start: 1.0
+  epsilon_end: 0.02
+  epsilon_decay: 0.999
+
+network:
+  hidden_sizes: []

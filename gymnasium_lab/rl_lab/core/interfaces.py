@@ -24,6 +24,8 @@ class RLAlgorithm(ABC):
         num_episodes: int = 10,
         seed: int | None = None,
         render: bool = False,
+        record_path: Path | None = None,
+        fps: int = 30,
     ) -> dict[str, Any]:
         """Evaluate a saved checkpoint."""
 

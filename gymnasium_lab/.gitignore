@@ -2,3 +2,4 @@ __pycache__/
 .pytest_cache/
 .venv/
 runs/
+scripts/frozenlake_gymnasium_q_learning_script.md
