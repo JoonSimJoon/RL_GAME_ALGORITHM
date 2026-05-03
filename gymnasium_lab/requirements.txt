@@ -1,0 +1,6 @@
+gymnasium[classic-control]
+numpy
+torch
+matplotlib
+pyyaml
+tqdm

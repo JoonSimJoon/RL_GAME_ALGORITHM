@@ -1,0 +1,17 @@
+env: cartpole
+algo: reinforce
+seed: 42
+device: cpu
+train_episodes: 350
+eval_episodes: 20
+eval_interval: 20
+plot_window: 20
+
+algo_params:
+  gamma: 0.99
+  lr: 0.001
+  normalize_returns: true
+  entropy_coef: 0.001
+
+network:
+  hidden_sizes: [128, 128]

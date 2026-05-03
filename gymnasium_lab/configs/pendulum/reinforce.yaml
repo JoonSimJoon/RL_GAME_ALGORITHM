@@ -1,0 +1,18 @@
+env: pendulum
+algo: reinforce
+seed: 42
+device: cpu
+train_episodes: 300
+eval_episodes: 10
+eval_interval: 20
+plot_window: 20
+
+algo_params:
+  gamma: 0.99
+  lr: 0.0007
+  init_log_std: -0.7
+  normalize_returns: true
+  entropy_coef: 0.0005
+
+network:
+  hidden_sizes: [128, 128]

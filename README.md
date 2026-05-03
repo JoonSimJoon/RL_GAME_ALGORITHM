@@ -301,6 +301,7 @@ RL_GAME_ALGORITHM/
 ├── week05_rl_basics/        # 5주차: MDP & 강화학습 기초
 ├── week06_q_learning/       # 6주차: Q-Learning
 ├── week07_dqn/              # 7주차: Deep Q-Network
+├── gymnasium_lab/           # Gymnasium 기반 독립 RL 실험 프로젝트
 ├── week08_policy_gradient/  # 8주차: Policy Gradient & Actor-Critic
 ├── week09_final_agent/      # 9주차: 종합 에이전트
 ├── week10_paper/            # 10주차: 논문 작성 & 발표

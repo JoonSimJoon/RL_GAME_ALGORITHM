@@ -1,0 +1,22 @@
+env: cartpole
+algo: dqn
+seed: 42
+device: cpu
+train_episodes: 350
+eval_episodes: 20
+eval_interval: 20
+plot_window: 20
+
+algo_params:
+  gamma: 0.99
+  lr: 0.001
+  batch_size: 64
+  buffer_size: 10000
+  min_buffer_size: 500
+  target_update_interval: 200
+  epsilon_start: 1.0
+  epsilon_end: 0.05
+  epsilon_decay: 0.985
+
+network:
+  hidden_sizes: [128, 128]
