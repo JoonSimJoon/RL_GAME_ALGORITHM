@@ -40,7 +40,10 @@ class SARSAAlgorithm(RLAlgorithm):
 
     def _greedy_action(self, state: int) -> int:
         assert self.q_table is not None
-        return int(np.argmax(self.q_table[state]))
+        q_values = self.q_table[state]
+        max_q = np.max(q_values)
+        best_actions = np.flatnonzero(q_values == max_q)
+        return int(np.random.choice(best_actions))
 
     def _epsilon_greedy_action(self, state: int, epsilon: float, action_space_n: int) -> int:
         if np.random.rand() < epsilon:
@@ -58,6 +61,7 @@ class SARSAAlgorithm(RLAlgorithm):
     ) -> dict[str, Any]:
         self.load(checkpoint_path)
         eval_seed = self.config["seed"] if seed is None else seed
+        set_global_seed(eval_seed)
         env_kwargs = dict(self.config.get("env_kwargs", {}))
         if record_path is not None:
             env_kwargs["render_mode"] = "rgb_array"
